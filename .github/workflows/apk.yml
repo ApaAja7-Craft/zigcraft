@@ -1,0 +1,23 @@
+name: apk
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build -Dandroid=true --verbose
+        working-directory: sdk/examples/minimal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minimal-apk
+          path: sdk/examples/minimal/zig-out/bin/*.apk
