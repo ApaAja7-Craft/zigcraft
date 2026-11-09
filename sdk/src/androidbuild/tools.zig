@@ -13,7 +13,7 @@ const AccessError = std.fs.Dir.AccessError;
 const Step = Build.Step;
 const ResolvedTarget = Build.ResolvedTarget;
 const LazyPath = std.Build.LazyPath;
-const Apk = @import("Apk.zig");
+const Apk = @import("apk.zig");
 const Ndk = @import("Ndk.zig");
 const BuildTools = @import("BuildTools.zig");
 
@@ -178,6 +178,10 @@ pub fn createApk(sdk: *Sdk, options: Apk.Options) *Apk {
     return Apk.create(sdk, options);
 }
 
+// TODO: Consider adding step to run: sdkmanager --install "ndk;21.3.6528147"
+// pub fn installNdkVersion(ndk_version: []const u8) *Step {
+// }
+
 /// Start an installed application on your Android device or emulator.
 /// To install an APK first see "addAdbInstall"
 ///
@@ -189,7 +193,7 @@ pub fn addAdbStart(sdk: *Sdk, package_name_and_java_entry: []const u8) *Step.Run
     if (sdk.platform_tools.adb.len == 0) {
         @panic("Cannot call addAdbStart as 'adb' is not installed");
     }
-    // NOTE(jae): Improve this to be its own special Step that can auto-detect the "com.zig.sdl2/com.zig.sdl2.ZigSDLActivity" data
+    // TODO: Improve this to be its own special Step that can auto-detect the "com.zig.sdl2/com.zig.sdl2.ZigSDLActivity" data
     const adb_shell_start = b.addSystemCommand(&.{ sdk.platform_tools.adb, "shell", "am", "start", "-S", "-W", "-n", package_name_and_java_entry });
     return adb_shell_start;
 }
@@ -203,7 +207,7 @@ pub fn adbInstall(sdk: *Sdk, apk: LazyPath) void {
 }
 
 /// Install an APK onto your Android device or emulator
-/// ie. "adb install -r ./zig-out/bin/minimal.apk"
+/// ie. "adb install ./zig-out/bin/minimal.apk"
 pub fn addAdbInstall(sdk: *Sdk, apk: LazyPath) *Step.Run {
     const b = sdk.b;
     if (sdk.platform_tools.adb.len == 0) {
@@ -212,7 +216,6 @@ pub fn addAdbInstall(sdk: *Sdk, apk: LazyPath) *Step.Run {
     const adb_install = b.addSystemCommand(&.{
         sdk.platform_tools.adb,
         "install",
-        "-r",
     });
     adb_install.addFileArg(apk);
     return adb_install;
@@ -544,30 +547,15 @@ const PathSearch = struct {
                 //     &b.graph.environ_map;
                 const maybe_user: ?[]const u8 = environ_map.get("USER") orelse null;
                 if (maybe_user) |user| {
-                    const maybe_jarsigner_path: ?[]const u8 = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16)
-                        b.findProgram(&.{"jarsigner"}, &.{
-                            // NOTE(jae): 2026-01-10
-                            // I manually put my install here, not standard per-se but I see no reason to not support this.
-                            b.fmt("/home/{s}/android-studio/jbr/bin", .{user}),
-                            // NOTE(jae): 2026-01-10
-                            // Suggested install locations for Android Studio from: https://developer.android.com/studio/install
-                            "/usr/local/android-studio/jbr/bin", // for your user profile
-                            "/opt/android-studio/jbr/bin", // for shared users
-                        }) catch null
-                    else
-                        b.findProgram(.{
-                            .names = &.{
-                                "jarsigner",
-                                // NOTE(jae): 2026-01-10
-                                // I manually put my install here, not standard per-se but I see no reason to not support this.
-                                b.fmt("/home/{s}/android-studio/jbr/bin/jarsigner", .{user}),
-                                // NOTE(jae): 2026-01-10
-                                // Suggested install locations for Android Studio from: https://developer.android.com/studio/install
-                                "/usr/local/android-studio/jbr/bin/jarsigner", // for your user profile
-                                "/opt/android-studio/jbr/bin/jarsigner", // for shared users
-                            },
-                        });
-                    const jarsigner_path = maybe_jarsigner_path orelse break :jdkpath null;
+                    const jarsigner_path = b.findProgram(&.{"jarsigner"}, &.{
+                        // NOTE(jae): 2026-01-10
+                        // I manually put my install here, not standard per-se but I see no reason to not support this.
+                        b.fmt("/home/{s}/android-studio/jbr/bin", .{user}),
+                        // NOTE(jae): 2026-01-10
+                        // Suggested install locations for Android Studio from: https://developer.android.com/studio/install
+                        "/usr/local/android-studio/jbr/bin", // for your user profile
+                        "/opt/android-studio/jbr/bin", // for shared users
+                    }) catch break :jdkpath null;
                     const jbr_bin_dir = std.fs.path.dirname(jarsigner_path) orelse break :jdkpath null;
                     const jbr_dir = std.fs.path.dirname(jbr_bin_dir) orelse break :jdkpath null;
                     break :jdkpath jbr_dir;

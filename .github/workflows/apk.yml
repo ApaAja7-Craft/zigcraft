@@ -13,7 +13,7 @@ jobs:
           java-version: 17
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.16.0
       - run: zig build -Dandroid=true --verbose
         working-directory: sdk/examples/minimal
       - uses: actions/upload-artifact@v4

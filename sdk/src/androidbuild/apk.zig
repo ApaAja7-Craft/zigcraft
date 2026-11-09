@@ -1,24 +1,24 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const Target = std.Target;
-const Step = std.Build.Step;
-const ResolvedTarget = std.Build.ResolvedTarget;
-const LazyPath = std.Build.LazyPath;
-const ArrayList = std.ArrayListUnmanaged;
 const builtin = @import("builtin");
-
 const androidbuild = @import("androidbuild.zig");
+const Sdk = @import("tools.zig");
+const BuiltinOptionsUpdate = @import("builtin_options_update.zig");
+const DirectoryFileInput = @import("DirectoryFileInput.zig");
+
+const Ndk = @import("Ndk.zig");
+const BuildTools = @import("BuildTools.zig");
+const D8Glob = @import("d8glob.zig");
+
+const KeyStore = Sdk.KeyStore;
 const ApiLevel = androidbuild.ApiLevel;
 const getAndroidTriple = androidbuild.getAndroidTriple;
 const runNameContext = androidbuild.runNameContext;
 const printErrorsAndExit = androidbuild.printErrorsAndExit;
-const BuildTools = @import("BuildTools.zig");
-const BuiltinOptionsUpdate = @import("BuiltinOptionsUpdate.zig");
-const D8Glob = @import("D8Glob.zig");
-const DirectoryFileInput = @import("DirectoryFileInput.zig");
-const Ndk = @import("Ndk.zig");
-const Sdk = @import("tools.zig");
-const KeyStore = Sdk.KeyStore;
+
+const Target = std.Target;
+const Step = std.Build.Step;
+const ResolvedTarget = std.Build.ResolvedTarget;
+const LazyPath = std.Build.LazyPath;
 
 pub const Resource = union(enum) {
     // file: File,
@@ -34,8 +34,6 @@ pub const Resource = union(enum) {
 };
 
 b: *std.Build,
-/// APK file output name, ie. "{name}.apk"
-name: []const u8,
 sdk: *Sdk,
 /// Path to Native Development Kit, this includes various C-code headers, libraries, and more.
 /// ie. $ANDROID_HOME/ndk/29.0.13113456
@@ -48,27 +46,17 @@ build_tools: BuildTools,
 api_level: ApiLevel,
 key_store: ?KeyStore,
 android_manifest: ?LazyPath,
-artifacts: ArrayList(*Step.Compile),
-/// Precompiled library files can be added to the APK to support features like Vulkan validation layers
-/// ie. https://developer.android.com/ndk/guides/graphics/validation-layer
-precompiled_library_files: ArrayList(PrecompiledLibraryFile),
-java_files: ArrayList(LazyPath),
-resources: ArrayList(Resource),
-assets: ArrayList(Resource),
+artifacts: std.ArrayListUnmanaged(*Step.Compile),
+java_files: std.ArrayListUnmanaged(LazyPath),
+resources: std.ArrayListUnmanaged(Resource),
+assets: std.ArrayListUnmanaged(Resource),
 
 pub const Options = struct {
-    /// APK file output name, ie. "{name}.apk"
-    name: []const u8,
-    /// "37.0.0" will use "$ANDROID_HOME/build-tools/37.0.0" which contains tools like:
-    /// "aapt2", "zipalign", "apksigner", "d8"
+    /// ie. "35.0.0"
     build_tools_version: []const u8,
-    /// "27.0.12077973" will is used to access:
-    /// - Include headers:  $ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/YOUR_HOST_OS_HERE/sysroot/usr/include
-    /// - System libraries: $ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/YOUR_HOST_OS_HERE/sysroot/usr/lib
+    /// ie. "27.0.12077973"
     ndk_version: []const u8,
-    /// .android15 = 35 (android 15 uses API version 35) decides on:
-    /// - System libraries:  $ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/$HOST_OS/sysroot/usr/lib/$TARGET_ARCH/$ANDROID_API_LEVEL
-    /// - Platform tool jar: $ANDROID_HOME/platforms/android-ANDROID_API_LEVEL
+    /// ie. .android15 = 35 (android 15 uses API version 35)
     api_level: ApiLevel,
 };
 
@@ -98,14 +86,12 @@ pub fn create(sdk: *Sdk, options: Options) *Apk {
     const apk: *Apk = b.allocator.create(Apk) catch @panic("OOM");
     apk.* = .{
         .b = b,
-        .name = options.name,
         .sdk = sdk,
         .ndk = ndk,
         .build_tools = build_tools,
         .api_level = options.api_level,
         .key_store = null,
         .android_manifest = null,
-        .precompiled_library_files = .empty,
         .artifacts = .empty,
         .java_files = .empty,
         .resources = .empty,
@@ -162,13 +148,7 @@ pub const AddJavaSourceFileOption = struct {
 /// of your APK.
 pub fn addJavaSourceFile(apk: *Apk, options: AddJavaSourceFileOption) void {
     const b = apk.b;
-    const java_file = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16)
-        // Deprecated: Just uses Build
-        options.file.dupe(b)
-    else
-        options.file.dupe(b.graph);
-
-    apk.java_files.append(b.allocator, java_file) catch @panic("OOM");
+    apk.java_files.append(b.allocator, options.file.dupe(b)) catch @panic("OOM");
 }
 
 pub const AddJavaSourceFilesOptions = struct {
@@ -192,16 +172,39 @@ pub fn setKeyStore(apk: *Apk, key_store: KeyStore) void {
     apk.key_store = key_store;
 }
 
-/// Add precompiled library files
-///
-/// This is useful for when you want to consume vendors compiled library files such as the Vulkan Validation layers
-/// ie. https://developer.android.com/ndk/guides/graphics/validation-layer
-pub fn addLibraryFile(apk: *Apk, android_target: androidbuild.AndroidTarget, path: LazyPath) void {
+fn addLibraryPaths(apk: *Apk, module: *std.Build.Module) void {
     const b = apk.b;
-    apk.precompiled_library_files.append(b.allocator, .{
-        .target = android_target.target(b),
-        .path = path,
-    }) catch @panic("OOM");
+    const android_ndk_sysroot = apk.ndk.sysroot_path;
+
+    // get target
+    const target: ResolvedTarget = module.resolved_target orelse {
+        @panic(b.fmt("no 'target' set on Android module", .{}));
+    };
+    const system_target = getAndroidTriple(target) catch |err| @panic(@errorName(err));
+
+    // NOTE(jae): 2024-09-11
+    // These *must* be in order of API version, then architecture, then non-arch specific otherwise
+    // when starting an *.so from Android or an emulator you can get an error message like this:
+    // - "java.lang.UnsatisfiedLinkError: dlopen failed: TLS symbol "_ZZN8gwp_asan15getThreadLocalsEvE6Locals" in dlopened"
+    const android_api_version: u32 = @intFromEnum(apk.api_level);
+
+    // NOTE(jae): 2025-03-09
+    // Resolve issue where building SDL2 gets the following error for 'arm-linux-androideabi'
+    // SDL2-2.32.2/src/cpuinfo/SDL_cpuinfo.c:93:10: error: 'cpu-features.h' file not found
+    //
+    // This include is specifically needed for: #if defined(__ANDROID__) && defined(__arm__) && !defined(HAVE_GETAUXVAL)
+    //
+    // ie. $ANDROID_HOME/ndk/{ndk_version}/sources/android/cpufeatures
+    if (target.result.cpu.arch == .arm) {
+        module.addIncludePath(.{
+            .cwd_relative = b.fmt("{s}/ndk/{s}/sources/android/cpufeatures", .{ apk.sdk.android_sdk_path, apk.ndk.version }),
+        });
+    }
+
+    // ie. $ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot ++ usr/lib/aarch64-linux-android/35
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/{s}/{d}", .{ android_ndk_sysroot, system_target, android_api_version }) });
+    // ie. $ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot ++ /usr/lib/aarch64-linux-android
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/{s}", .{ android_ndk_sysroot, system_target }) });
 }
 
 pub fn installApk(apk: *Apk) void {
@@ -216,7 +219,7 @@ pub fn addInstallApk(apk: *Apk) *Step.InstallFile {
     };
 }
 
-fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
+fn doInstallApk(apk: *Apk) std.mem.Allocator.Error!*Step.InstallFile {
     const b = apk.b;
 
     const key_store: KeyStore = apk.key_store orelse .empty;
@@ -279,22 +282,16 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         @panic("call setAndroidManifestFile and point to your AndroidManifest.xml file");
     };
 
-    // NOTE(jae): 2024-10-01
-    // Consider adding option where you can explicitly set an optional release mode with like:
+    // TODO(jae): 2024-10-01
+    // Add option where you can explicitly set an optional release mode with like:
     // - setMode(.debug)
     //
     // If that value ISN'T set then we can just infer based on optimization level.
     const debug_apk: bool = blk: {
         for (apk.artifacts.items) |root_artifact| {
             if (root_artifact.root_module.optimize) |optimize| {
-                if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-                    if (optimize == .Debug) {
-                        break :blk true;
-                    }
-                } else {
-                    if (optimize == .debug) {
-                        break :blk true;
-                    }
+                if (optimize == .Debug) {
+                    break :blk true;
                 }
             }
         }
@@ -302,14 +299,12 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
     };
 
     // ie. "$ANDROID_HOME/Sdk/platforms/android-{api_level}/android.jar"
-    const root_jar: LazyPath = .{
-        .cwd_relative = b.pathResolve(&[_][]const u8{
-            apk.sdk.android_sdk_path,
-            "platforms",
-            b.fmt("android-{d}", .{@intFromEnum(apk.api_level)}),
-            "android.jar",
-        }),
-    };
+    const root_jar = b.pathResolve(&[_][]const u8{
+        apk.sdk.android_sdk_path,
+        "platforms",
+        b.fmt("android-{d}", .{@intFromEnum(apk.api_level)}),
+        "android.jar",
+    });
 
     // Make resources.apk from:
     // - resources.flat.zip (created from "aapt2 compile")
@@ -324,18 +319,13 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         const aapt2link = b.addSystemCommand(&[_][]const u8{
             apk.build_tools.aapt2,
             "link",
+            "-I", // add an existing package to base include set
+            root_jar,
         });
         aapt2link.setName(runNameContext("aapt2 link"));
 
-        // Add '-I android_sdk/platforms/android_version/android.jar'
-        aapt2link.addArg("-I");
-        aapt2link.addFileArg(root_jar);
-
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-            // Deprecated: b.verbose no longer exists
-            if (b.verbose) {
-                aapt2link.addArg("-v");
-            }
+        if (b.verbose) {
+            aapt2link.addArg("-v");
         }
 
         // Inserts android:debuggable="true" in to the application node of the manifest,
@@ -412,7 +402,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         break :blk resources_apk_file;
     };
 
-    const package_name_file: LazyPath = blk: {
+    const package_name_file = blk: {
         const aapt2packagename = b.addSystemCommand(&[_][]const u8{
             apk.build_tools.aapt2,
             "dump",
@@ -423,12 +413,15 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         const aapt2_package_name_file = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15)
             aapt2packagename.captureStdOut()
         else
-            aapt2packagename.captureStdOut(.{ .trim_whitespace = .trailing });
+            aapt2packagename.captureStdOut(.{});
         break :blk aapt2_package_name_file;
     };
 
-    const android_builtin_options = BuiltinOptionsUpdate.create(b, package_name_file);
-    const android_builtin_mod = android_builtin_options.createModule();
+    const android_builtin = blk: {
+        const android_builtin_options = std.Build.addOptions(b);
+        BuiltinOptionsUpdate.create(b, android_builtin_options, package_name_file);
+        break :blk android_builtin_options.createModule();
+    };
 
     // We could also use that information to create easy to use Zig step like
     // - zig build adb-uninstall (adb uninstall "com.zig.sdl2")
@@ -446,23 +439,6 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
     // - classes.dex
     const apk_files = b.addWriteFiles();
 
-    // Add support for adding compiled library files (Vulkan Validation layers)
-    // ie. https://developer.android.com/ndk/guides/graphics/validation-layer
-    for (apk.precompiled_library_files.items) |precompiled_library| {
-        const so_dir = androidbuild.getTargetLibDir(b, precompiled_library.target);
-        // NOTE(jae): 2026-04-12
-        // Can likely just change to "precompiled_library.path.basename()" in the future if this breaks
-        const precompiled_lib_basename = std.fs.path.basename(switch (precompiled_library.path) {
-            .src_path => |sp| sp.sub_path,
-            .cwd_relative => |sub_path| sub_path,
-            .generated => @panic("invalid precompiled library, cannot be generated"),
-            .dependency => |dep| dep.sub_path,
-            // TODO(jae): 2026-06-29: Handle .relative in Zig 0.17.X
-            // .relative => @panic("UNHANDLED: invalid relative path"),
-        });
-        _ = apk_files.addCopyFile(precompiled_library.path, b.fmt("lib/{s}/{s}", .{ so_dir, precompiled_lib_basename }));
-    }
-
     // These files belong in root and *must not* be compressed
     // - resources.arsc
     const apk_files_not_compressed = b.addWriteFiles();
@@ -473,149 +449,92 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
     // - i686-linux-android
     // - x86_64-linux-android
     for (apk.artifacts.items, 0..) |artifact, artifact_index| {
-        if (artifact.root_module.resolved_target == null) {
+        const target: ResolvedTarget = artifact.root_module.resolved_target orelse {
             @panic(b.fmt("artifact[{d}] has no 'target' set", .{artifact_index}));
-        }
+        };
 
-        // Add libraries *and* this artifact (exe) to collected libraries
+        // NOTE(jae): 2026-02-01
+        // If not explicitly set in users build, default to using LLVM and LLD for Android builds
+        // as that's the same toolchain that the Android SDK uses.
         //
-        // As of Zig 0.15.2 the order looks like
-        // - your_app_name
-        // - SDL3
-        // - freetype
-        // - imgui
-        const compile_dep_list = apk.getCompileDependencies(artifact, true);
-
-        for (compile_dep_list) |compile_dep| {
-            const graph = apk.getGraph(compile_dep.root_module);
-
-            // Update android_builtin
-            for (graph.modules) |module| {
-                if (module.import_table.get("android_builtin")) |prev_module| {
-                    if (prev_module != android_builtin_mod) {
-                        module.addImport("android_builtin", android_builtin_mod);
-                        compile_dep.step.dependOn(&android_builtin_options.options.step);
-                    }
-                }
-            }
-
-            // Update translate-c module
-            for (graph.modules) |module| {
-                const root_source_file = module.root_source_file orelse continue;
-                const c_translate_target = module.resolved_target orelse continue;
-                if (!c_translate_target.result.abi.isAndroid()) continue;
-                switch (root_source_file) {
-                    .generated => |gen| {
-                        const step: *std.Build.Step = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16)
-                            // Deprecated: Zig 0.16.X, used to get Step directly
-                            gen.file.step
-                        else
-                            b.graph.generated_files.items[@intFromEnum(gen.index)];
-                        const tag = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16)
-                            // Deprecated: Zig 0.16.X, renamed to tag in later versions
-                            step.id
-                        else
-                            step.tag;
-                        switch (tag) {
-                            .translate_c => {
-                                // Detect if using Translate-C vendored version
-                                //
-                                // NOTE(jae): 2026-04-29
-                                // Longterm this will deprecated from Zig
-
-                                const translate_c: *std.Build.Step.TranslateC = @fieldParentPtr("step", step);
-                                translate_c.addIncludePath(.{ .cwd_relative = apk.ndk.include_path });
-                                translate_c.addSystemIncludePath(.{ .cwd_relative = apk.getSystemIncludePath(c_translate_target) });
-
-                                // NOTE(jae): 2026-06-14 - Zig 0.16.0
-                                // Patch Aro/Translate-C to fix issues with SDL3 using translate-c.
-                                // - _Nullable not working
-                                // - _Nonnull not working
-                                // - Force _FORTIFY_SOURCE to 0 to avoid references to missing functions
-                                //
-                                // Possibly related: https://github.com/Vexu/arocc/issues/989
-                                translate_c.defineCMacro("_Nullable", "");
-                                translate_c.defineCMacro("_Nonnull", "");
-                                translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
-                                translate_c.defineCMacro("__ANDROID_API__", b.fmt("{}", .{@intFromEnum(apk.api_level)}));
-                            },
-                            .run => {
-                                // Detect if using Translate-C external dependency and make assumptions about the flags
-                                // we can pass into it such as "isystem" and "-I"
-                                //
-                                // Name: https://codeberg.org/ziglang/translate-c/src/commit/71642ad0084d433f14b091a7b2b109f0be915dbb/build/Translator.zig#L89
-                                // Imports: https://codeberg.org/ziglang/translate-c/src/commit/71642ad0084d433f14b091a7b2b109f0be915dbb/build/Translator.zig#L103-L104
-                                if (std.mem.startsWith(u8, step.name, "translate-c ") and
-                                    (module.import_table.contains("c_builtins") and module.import_table.contains("helpers")))
-                                {
-                                    const run: *std.Build.Step.Run = @fieldParentPtr("step", step);
-
-                                    const ndk_include_path: LazyPath = .{ .cwd_relative = apk.ndk.include_path };
-                                    const system_include_path: LazyPath = .{ .cwd_relative = apk.getSystemIncludePath(c_translate_target) };
-
-                                    // Exposes the system include path `path` to both translate-c and to `t.mod`.
-                                    // https://codeberg.org/ziglang/translate-c/src/commit/71642ad0084d433f14b091a7b2b109f0be915dbb/build/Translator.zig#L207-L211
-                                    module.addSystemIncludePath(system_include_path);
-                                    run.addPrefixedDirectoryArg("-isystem", system_include_path);
-
-                                    // Exposes the include path `path` to both translate-c and to `t.mod`.
-                                    // https://codeberg.org/ziglang/translate-c/src/commit/71642ad0084d433f14b091a7b2b109f0be915dbb/build/Translator.zig#L203-L206
-                                    module.addIncludePath(ndk_include_path);
-                                    run.addPrefixedDirectoryArg("-I", ndk_include_path);
-                                }
-                            },
-                            else => continue,
-                        }
-                    },
-                    else => continue,
-                }
-            }
-
-            // update linked libraries that use C or C++ to:
-            // - use Android LibC file
-            // - add Android NDK library paths. (libandroid, liblog, etc)
-            switch (compile_dep.kind) {
-                .lib => {
-                    // if (compile_dep.linkage.? == .static) {
-                    //     if (compile_dep.root_module.pic == null) {
-                    //         compile_dep.root_module.pic = true;
-                    //     }
-                    // }
-
-                    // Update updateSharedLibraryOptions, libCFile
-                    apk.updateArtifact(compile_dep, apk_files);
-
-                    // Apply workaround for Zig 0.14.0 and Zig 0.15.X
-                    apk.applyLibLinkCppWorkaroundIssue19(compile_dep);
-                },
-                else => continue,
-            }
+        // This also can resolve issues with Zigs linker not yet supporting certain compression schemes/etc
+        if (artifact.use_llvm == null) {
+            artifact.use_llvm = true;
         }
+        if (artifact.use_lld == null) {
+            artifact.use_lld = true;
+        }
+
+        // https://developer.android.com/ndk/guides/abis#native-code-in-app-packages
+        const so_dir: []const u8 = switch (target.result.cpu.arch) {
+            .aarch64 => "arm64-v8a",
+            .arm => "armeabi-v7a",
+            .x86_64 => "x86_64",
+            .x86 => "x86",
+            else => @panic(b.fmt("unsupported or unhandled arch: {s}", .{@tagName(target.result.cpu.arch)})),
+        };
+        _ = apk_files.addCopyFile(artifact.getEmittedBin(), b.fmt("lib/{s}/libmain.so", .{so_dir}));
+
         // Add module
         // - If a module has no `root_source_file` (e.g you're only compiling C files using `addCSourceFiles`)
         //   then adding an import module will cause a build error (as of Zig 0.15.1).
         if (artifact.root_module.root_source_file != null) {
-            const module = artifact.root_module;
-            if (module.import_table.get("android_builtin")) |prev_module| {
-                if (prev_module != android_builtin_mod) {
-                    artifact.root_module.addImport("android_builtin", android_builtin_mod);
-                }
+            artifact.root_module.addImport("android_builtin", android_builtin);
+        }
+
+        var modules_it = artifact.root_module.import_table.iterator();
+        while (modules_it.next()) |entry| {
+            const module = entry.value_ptr.*;
+            if (module.import_table.get("android_builtin")) |_| {
+                module.addImport("android_builtin", android_builtin);
             }
         }
+
+        // Find TranslateC dependencies and add system path
+        var iter = artifact.root_module.import_table.iterator();
+        while (iter.next()) |it| {
+            const module = it.value_ptr.*;
+            const root_source_file = module.root_source_file orelse continue;
+            switch (root_source_file) {
+                .generated => |gen| {
+                    const step = gen.file.step;
+                    if (step.id != .translate_c) {
+                        continue;
+                    }
+                    const c_translate_target = module.resolved_target orelse continue;
+                    if (!c_translate_target.result.abi.isAndroid()) {
+                        continue;
+                    }
+                    const translate_c: *std.Build.Step.TranslateC = @fieldParentPtr("step", step);
+                    translate_c.addIncludePath(.{ .cwd_relative = apk.ndk.include_path });
+                    translate_c.addSystemIncludePath(.{ .cwd_relative = apk.getSystemIncludePath(c_translate_target) });
+                },
+                else => continue,
+            }
+        }
+
+        // update linked libraries that use C or C++ to:
+        // - use Android LibC file
+        // - add Android NDK library paths. (libandroid, liblog, etc)
+        apk.updateLinkObjects(artifact, so_dir, apk_files);
 
         // update artifact to:
         // - Be configured to work correctly on Android
         // - To know where C header /lib files are via setLibCFile and linkLibC
         // - Provide path to additional libraries to link to
         {
-            if (artifact.root_module.link_libc == null) {
-                artifact.root_module.link_libc = true;
+            if (artifact.linkage) |linkage| {
+                if (linkage == .dynamic) {
+                    updateSharedLibraryOptions(artifact);
+                }
             }
-            apk.updateArtifact(artifact, apk_files);
+            apk.setLibCFile(artifact);
+            apk.addLibraryPaths(artifact.root_module);
+            artifact.root_module.link_libc = true;
 
             // Apply workaround for Zig 0.14.0 stable
             //
-            // This *must* occur after apk.updateArtifact (apk.updateLinkObjects) for the root package otherwise
+            // This *must* occur after "apk.updateLinkObjects" for the root package otherwise
             // you may get an error like: "unable to find dynamic system library 'c++abi_zig_workaround'"
             apk.applyLibLinkCppWorkaroundIssue19(artifact);
         }
@@ -633,22 +552,13 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
             // Source: https://github.com/libsdl-org/SDL/blob/release-2.30.7/android-project/app/src/main/java/org/libsdl/app/SDLActivity.java#L2045
             "-encoding",
             "utf8",
+            "-cp",
+            root_jar,
+            // NOTE(jae): 2024-09-19
+            // Debug issues with the SDL.java classes
+            // "-Xlint:deprecation",
         });
         javac_cmd.setName(runNameContext("javac"));
-
-        // Add root jar
-        javac_cmd.addArg("-cp");
-        javac_cmd.addFileArg(root_jar);
-
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-            // NOTE(jae): 2026-03-01
-            // If we have verbose logging on, telling us about deprecated Java files
-            if (b.verbose) {
-                javac_cmd.addArg("-Xlint:deprecation");
-            }
-        }
-
-        // Output directory
         javac_cmd.addArg("-d");
         const java_classes_output_dir = javac_cmd.addOutputDirectoryArg("android_classes");
 
@@ -664,8 +574,23 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         });
         d8.setName(runNameContext("d8"));
 
-        // Add JDK bin path so d8 can always find "java", etc
-        try apk.updatePathWithJdk(d8);
+        // Prepend JDK bin path so d8 can always find "java", etc
+        if (apk.sdk.jdk_path.len > 0) {
+            var env_map = d8.getEnvMap();
+            const path = env_map.get("PATH") orelse &[0]u8{};
+            const new_path = try std.mem.join(b.allocator, &[1]u8{std.fs.path.delimiter}, &.{
+                b.fmt("{s}/bin", .{apk.sdk.jdk_path}),
+                path,
+            });
+            try env_map.put("PATH", new_path);
+        }
+
+        // ie. android_sdk/platforms/android-{api-level}/android.jar
+        d8.addArg("--lib");
+        d8.addArg(root_jar);
+
+        d8.addArg("--output");
+        const dex_output_dir = d8.addOutputDirectoryArg("android_dex");
 
         // NOTE(jae): 2024-09-22
         // As per documentation for d8, we may want to specific the minimum API level we want
@@ -674,19 +599,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         // d8.addArg(number_as_string);
 
         // add each output *.class file
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-            D8Glob.create(b, d8, java_classes_output_dir, root_jar);
-        } else {
-            // TODO(jae): 2026-06-29: Update D8Glob to collect files as seperate Run artifact
-            @compileError("TODO: Rewrite D8Glob to use Step.Run");
-        }
-
-        // ie. android_sdk/platforms/android-{api-level}/android.jar
-        d8.addArg("--lib");
-        d8.addFileArg(root_jar);
-
-        d8.addArg("--output");
-        const dex_output_dir = d8.addOutputDirectoryArg("android_dex");
+        D8Glob.create(b, d8, java_classes_output_dir);
         const dex_file = dex_output_dir.path(b, "classes.dex");
 
         // Append classes.dex to apk
@@ -700,8 +613,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
             apk.sdk.java_tools.jar,
         });
         jar.setName(runNameContext("jar (unzip resources.apk)"));
-
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16 and b.verbose) {
+        if (b.verbose) {
             jar.addArg("--verbose");
         }
 
@@ -759,7 +671,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         // -M, --no-manifest = Do not create a manifest file for the entries
         // -0, --no-compress = Store only; use no ZIP compression
         const compress_zip_arg = "-cfM";
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16 and b.verbose) jar.addArg(compress_zip_arg ++ "v") else jar.addArg(compress_zip_arg);
+        if (b.verbose) jar.addArg(compress_zip_arg ++ "v") else jar.addArg(compress_zip_arg);
         const output_zip_file = jar.addOutputFileArg("compiled_code.zip");
         jar.addArg(".");
 
@@ -786,10 +698,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         // -M, --no-manifest = Do not create a manifest file for the entries
         // -0, --no-compress = Store only; use no ZIP compression
         const update_zip_arg = "-ufM0";
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16 and b.verbose)
-            jar.addArg(update_zip_arg ++ "v")
-        else
-            jar.addArg(update_zip_arg);
+        if (b.verbose) jar.addArg(update_zip_arg ++ "v") else jar.addArg(update_zip_arg);
         jar.addFileArg(zip_file);
         jar.addArg(".");
         break :blk &jar.step;
@@ -807,6 +716,8 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
     // lint.setEnvironmentVariable("JAVA_HOME", apk.tools.jdk_path);
     // lint.addFileArg(android_manifest_file);
 
+    const apk_name = apk.artifacts.items[0].name;
+
     // Align contents of .apk (zip)
     const aligned_apk_file: LazyPath = blk: {
         var zipalign = b.addSystemCommand(&[_][]const u8{
@@ -819,7 +730,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         // Source: https://developer.android.com/tools/zipalign (10th Sept, 2024)
         //
         // Example: "zipalign -P 16 -f -v 4 infile.apk outfile.apk"
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16 and b.verbose) {
+        if (b.verbose) {
             zipalign.addArg("-v");
         }
         zipalign.addArgs(&.{
@@ -834,7 +745,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         zipalign.addFileArg(zip_file);
         zipalign.step.dependOn(update_zip);
 
-        const apk_file = zipalign.addOutputFileArg(b.fmt("aligned-{s}.apk", .{apk.name}));
+        const apk_file = zipalign.addOutputFileArg(b.fmt("aligned-{s}.apk", .{apk_name}));
         break :blk apk_file;
     };
 
@@ -855,7 +766,7 @@ fn doInstallApk(apk: *Apk) Allocator.Error!*Step.InstallFile {
         break :blk signed_output_apk_file;
     };
 
-    const install_apk = b.addInstallBinFile(signed_apk_file, b.fmt("{s}.apk", .{apk.name}));
+    const install_apk = b.addInstallBinFile(signed_apk_file, b.fmt("{s}.apk", .{apk_name}));
     return install_apk;
 }
 
@@ -872,157 +783,45 @@ fn setLibCFile(apk: *Apk, compile: *Step.Compile) void {
     compile.setLibCFile(android_libc_path);
 }
 
-/// Copy-paste of "lib/std/Build/Module.zig" but it doesn't cache via GetGraph and won't potentially break the
-/// Zig build system.
-///
-/// Return the full set of `Step.Compile` which `start` depends on, recursively. `start` itself is
-/// always returned as the first element. If `chase_dynamic` is `false`, then dynamic libraries are
-/// not included, and their dependencies are not considered; if `chase_dynamic` is `true`, dynamic
-/// libraries are treated the same as other linked `Compile`s.
-fn getCompileDependencies(apk: *Apk, start: *Step.Compile, chase_dynamic: bool) []const *Step.Compile {
-    const arena = start.step.owner.graph.arena;
-
-    var compiles: std.AutoArrayHashMapUnmanaged(*Step.Compile, void) = .empty;
-    var next_idx: usize = 0;
-
-    compiles.putNoClobber(arena, start, {}) catch @panic("OOM");
-
-    while (next_idx < compiles.count()) {
-        const compile = compiles.keys()[next_idx];
-        next_idx += 1;
-
-        for (apk.getGraph(compile.root_module).modules) |mod| {
-            for (mod.link_objects.items) |lo| {
-                switch (lo) {
-                    .other_step => |other_compile| {
-                        if (!chase_dynamic and other_compile.isDynamicLibrary()) continue;
-                        compiles.put(arena, other_compile, {}) catch @panic("OOM");
-                    },
-                    else => {},
-                }
-            }
-        }
-    }
-
-    return compiles.keys();
-}
-
-const Graph = struct {
-    modules: []const *std.Build.Module,
-    names: []const []const u8,
-};
-
-/// Copy-paste of "lib/std/Build/Module.zig" but it doesn't cache and won't potentially break the
-/// Zig build system.
-///
-/// Given that `root` is the root `Module` of a compilation, return all `Module`s
-/// in the module graph, including `root` itself. `root` is guaranteed to be the
-/// first module in the returned slice.
-fn getGraph(apk: *Apk, root: *std.Build.Module) Graph {
-    const arena = apk.b.graph.arena;
-
-    var modules: std.AutoArrayHashMapUnmanaged(*std.Build.Module, []const u8) = .empty;
-    var next_idx: usize = 0;
-
-    modules.putNoClobber(arena, root, "root") catch @panic("OOM");
-
-    while (next_idx < modules.count()) {
-        const mod = modules.keys()[next_idx];
-        next_idx += 1;
-        modules.ensureUnusedCapacity(arena, mod.import_table.count()) catch @panic("OOM");
-        for (mod.import_table.keys(), mod.import_table.values()) |import_name, other_mod| {
-            modules.putAssumeCapacity(other_mod, import_name);
-        }
-    }
-
-    const result: Graph = .{
-        .modules = modules.keys(),
-        .names = modules.values(),
-    };
-    return result;
-}
-
-fn updateArtifact(apk: *Apk, artifact: *Step.Compile, raw_top_level_apk_files: *Step.WriteFile) void {
+fn updateLinkObjects(apk: *Apk, root_artifact: *Step.Compile, so_dir: []const u8, raw_top_level_apk_files: *Step.WriteFile) void {
     const b = apk.b;
+    for (root_artifact.root_module.link_objects.items) |link_object| {
+        switch (link_object) {
+            .other_step => |artifact| {
+                switch (artifact.kind) {
+                    .lib => {
+                        // If you have a library that is being built as an *.so then install it
+                        // alongside your library.
+                        //
+                        // This was initially added to support building SDL2 with Zig.
+                        if (artifact.linkage) |linkage| {
+                            if (linkage == .dynamic) {
+                                updateSharedLibraryOptions(artifact);
+                                _ = raw_top_level_apk_files.addCopyFile(artifact.getEmittedBin(), b.fmt("lib/{s}/lib{s}.so", .{ so_dir, artifact.name }));
+                            }
+                        }
 
-    // Set page size to 16KB-aligned binaries by default
-    //
-    // For Android NDK r27 onwards, Android recommends the following setting by default
-    // Source: https://developer.android.com/guide/practices/page-sizes#compile-r27
-    //
-    // NOTE(jae): 2026-04-23
-    // Zig 0.16.0 stable does not do this by default and without this line, there is a pop-up
-    // warning when testing on Pixel 10, Android 17 VM device.
-    // Screenshot is on Github issue here: https://github.com/silbinarywolf/zig-android-sdk/issues/87
-    if (artifact.link_z_max_page_size == null) {
-        artifact.link_z_max_page_size = 16384;
-    }
+                        // If library is built using C or C++ then setLibCFile
+                        if (artifact.root_module.link_libc == true or
+                            artifact.root_module.link_libcpp == true)
+                        {
+                            apk.setLibCFile(artifact);
+                        }
 
-    // If you have a library that is being built as an *.so then install it
-    // alongside your library.
-    //
-    // This was initially added to support building SDL2 with Zig.
-    if (artifact.linkage) |linkage| {
-        if (linkage == .dynamic) {
-            updateSharedLibraryOptions(artifact);
+                        // Add library paths to find "android", "log", etc
+                        apk.addLibraryPaths(artifact.root_module);
 
-            // https://developer.android.com/ndk/guides/abis#native-code-in-app-packages
-            const target = artifact.root_module.resolved_target orelse unreachable;
-            const so_dir = androidbuild.getTargetLibDir(b, target);
-            _ = raw_top_level_apk_files.addCopyFile(artifact.getEmittedBin(), b.fmt("lib/{s}/lib{s}.so", .{ so_dir, artifact.name }));
+                        // Update libraries linked to this library
+                        apk.updateLinkObjects(artifact, so_dir, raw_top_level_apk_files);
+
+                        // Apply workaround for Zig 0.14.0 and Zig 0.15.X
+                        apk.applyLibLinkCppWorkaroundIssue19(artifact);
+                    },
+                    else => continue,
+                }
+            },
+            else => {},
         }
-    }
-
-    // NOTE(jae): 2026-02-01
-    // If not explicitly set in users build, default to using LLVM and LLD for Android builds
-    // as that's the same toolchain that the Android SDK uses.
-    //
-    // This also can resolve issues with Zigs linker not yet supporting certain compression schemes/etc
-    if (artifact.use_lld == null) {
-        artifact.use_lld = true;
-    }
-    if (artifact.use_llvm == null) {
-        artifact.use_llvm = true;
-    }
-
-    // If library is built using C or C++ then setLibCFile
-    if (artifact.root_module.link_libc == true or
-        artifact.root_module.link_libcpp == true)
-    {
-        apk.setLibCFile(artifact);
-    }
-
-    // Add library paths to find "android", "log", etc
-    {
-        const module = artifact.root_module;
-        const target: ResolvedTarget = module.resolved_target orelse {
-            @panic(b.fmt("no 'target' set on Android module", .{}));
-        };
-        const system_target = getAndroidTriple(target) catch |err| @panic(@errorName(err));
-
-        // NOTE(jae): 2024-09-11
-        // These *must* be in order of API version, then architecture, then non-arch specific otherwise
-        // when starting an *.so from Android or an emulator you can get an error message like this:
-        // - "java.lang.UnsatisfiedLinkError: dlopen failed: TLS symbol "_ZZN8gwp_asan15getThreadLocalsEvE6Locals" in dlopened"
-        const android_api_version: u32 = @intFromEnum(apk.api_level);
-
-        // NOTE(jae): 2025-03-09
-        // Resolve issue where building SDL2 gets the following error for 'arm-linux-androideabi'
-        // SDL2-2.32.2/src/cpuinfo/SDL_cpuinfo.c:93:10: error: 'cpu-features.h' file not found
-        //
-        // This include is specifically needed for: #if defined(__ANDROID__) && defined(__arm__) && !defined(HAVE_GETAUXVAL)
-        //
-        // ie. $ANDROID_HOME/ndk/{ndk_version}/sources/android/cpufeatures
-        if (target.result.cpu.arch == .arm) {
-            module.addIncludePath(.{
-                .cwd_relative = b.fmt("{s}/ndk/{s}/sources/android/cpufeatures", .{ apk.sdk.android_sdk_path, apk.ndk.version }),
-            });
-        }
-
-        // ie. $ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot ++ usr/lib/aarch64-linux-android/35
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/{s}/{d}", .{ apk.ndk.sysroot_path, system_target, android_api_version }) });
-        // ie. $ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot ++ /usr/lib/aarch64-linux-android
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/{s}", .{ apk.ndk.sysroot_path, system_target }) });
     }
 }
 
@@ -1037,7 +836,7 @@ fn applyLibLinkCppWorkaroundIssue19(apk: *Apk, artifact: *Step.Compile) void {
     const b = apk.b;
 
     const should_apply_fix = (artifact.root_module.link_libcpp == true or
-        apk.dependsOnSystemLibrary(artifact, "c++abi_zig_workaround"));
+        dependsOnSystemLibrary(artifact, "c++abi_zig_workaround"));
     if (!should_apply_fix) {
         return;
     }
@@ -1079,9 +878,9 @@ fn applyLibLinkCppWorkaroundIssue19(apk: *Apk, artifact: *Step.Compile) void {
 
 /// Copy-paste of "dependsOnSystemLibrary" that only checks if that system library is included to
 /// workaround a bug with in Zig 0.15.0-dev.1092+d772c0627
-fn dependsOnSystemLibrary(apk: *Apk, compile: *Step.Compile, name: []const u8) bool {
-    for (apk.getCompileDependencies(compile, true)) |dep_compile| {
-        for (apk.getGraph(dep_compile.root_module).modules) |mod| {
+fn dependsOnSystemLibrary(compile: *Step.Compile, name: []const u8) bool {
+    for (compile.getCompileDependencies(true)) |some_compile| {
+        for (some_compile.root_module.getGraph().modules) |mod| {
             for (mod.link_objects.items) |lo| {
                 switch (lo) {
                     .system_lib => |lib| if (std.mem.eql(u8, lib.name, name)) return true,
@@ -1111,14 +910,10 @@ fn updateSharedLibraryOptions(artifact: *std.Build.Step.Compile) void {
 
     if (artifact.root_module.optimize) |optimize| {
         // NOTE(jae): ZigAndroidTemplate used: (optimize == .ReleaseSmall);
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-            artifact.root_module.strip = optimize == .ReleaseSmall;
-        } else {
-            artifact.root_module.strip = optimize == .small;
-        }
+        artifact.root_module.strip = optimize == .ReleaseSmall;
     }
 
-    // NOTE(jae): 2024-09-19 - Copy-pasted from https://github.com/ikskuh/ZigAndroidTemplate/blob/master/Sdk.zig
+    // TODO(jae): 2024-09-19 - Copy-pasted from https://github.com/ikskuh/ZigAndroidTemplate/blob/master/Sdk.zig
     // Remove when https://github.com/ziglang/zig/issues/7935 is resolved.
     if (artifact.root_module.resolved_target) |target| {
         if (target.result.cpu.arch == .x86) {
@@ -1154,41 +949,18 @@ fn updateSharedLibraryOptions(artifact: *std.Build.Step.Compile) void {
 }
 
 /// Prepend JDK bin path so "d8", "apksigner", etc can always find "java"
-fn updatePathWithJdk(apk: *Apk, run: *std.Build.Step.Run) Allocator.Error!void {
+fn updatePathWithJdk(apk: *Apk, run: *std.Build.Step.Run) !void {
     if (apk.sdk.jdk_path.len == 0) return;
 
     const b = apk.b;
 
-    if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15) {
-        // Deprecated path: Add "java" path to env
-        var env_map = run.getEnvMap();
-        const path = env_map.get("PATH") orelse &[0]u8{};
-        const new_path = try std.mem.join(b.allocator, &[1]u8{std.fs.path.delimiter}, &.{
-            b.fmt("{s}/bin", .{apk.sdk.jdk_path}),
-            path,
-        });
-        // NOTE(jae): 2026-06-29
-        // Old version allowed mutating the env_map directly
-        try env_map.put("PATH", new_path);
-    } else if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-        // Deprecated: addPathDir was removed
-        run.addPathDir(b.pathJoin(&.{ apk.sdk.jdk_path, "bin" }));
-    } else {
-        var env_map = run.getEnvMap();
-        const path = env_map.get("PATH") orelse &[0]u8{};
-        const new_path = try std.mem.join(b.allocator, &[1]u8{std.fs.path.delimiter}, &.{
-            b.fmt("{s}/bin", .{apk.sdk.jdk_path}),
-            path,
-        });
-        run.setEnvironmentVariable("PATH", new_path);
-    }
+    var env_map = run.getEnvMap();
+    const path = env_map.get("PATH") orelse &[0]u8{};
+    const new_path = try std.mem.join(b.allocator, &[1]u8{std.fs.path.delimiter}, &.{
+        b.fmt("{s}/bin", .{apk.sdk.jdk_path}),
+        path,
+    });
+    try env_map.put("PATH", new_path);
 }
-
-const PrecompiledLibraryFile = struct {
-    /// The target it belongs to
-    target: ResolvedTarget,
-    /// A precompiled *.so file like "libVkLayer_khronos_validation.so"
-    path: LazyPath,
-};
 
 const Apk = @This();

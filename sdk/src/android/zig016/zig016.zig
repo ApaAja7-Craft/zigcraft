@@ -5,10 +5,7 @@ const builtin = @import("builtin");
 const ndk = @import("ndk");
 
 const android_builtin = @import("android_builtin");
-const package_name: ?[*:0]const u8 = if (android_builtin.package_name.len > 0)
-    std.fmt.comptimePrint("{s}", .{android_builtin.package_name})
-else
-    null;
+const package_name: ?[*:0]const u8 = if (android_builtin.package_name.len > 0) android_builtin.package_name else null;
 
 const LogFunction = fn (comptime message_level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void;
 
@@ -23,7 +20,7 @@ pub fn wrapLogFn(comptime logFn: fn (
             // NOTE(jae): 2024-09-11
             // Zig has a colon ": " or "): " for scoped but Android logs just do that after being flushed
             // So we don't do that here.
-            const scope_prefix_text = if (scope == .default) "" else @tagName(scope) ++ ": ";
+            const scope_prefix_text = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ")"; // "): ";
             return logFn(message_level, scope_prefix_text, format, args);
         }
     }.standardLogFn;

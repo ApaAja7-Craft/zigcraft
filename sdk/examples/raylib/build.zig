@@ -1,7 +1,6 @@
 const std = @import("std");
-const LinkMode = std.builtin.LinkMode;
-
 const android = @import("android");
+const LinkMode = std.builtin.LinkMode;
 
 const exe_name = "raylib";
 
@@ -21,7 +20,6 @@ pub fn build(b: *std.Build) void {
 
         const android_sdk = android.Sdk.create(b, .{});
         const apk = android_sdk.createApk(.{
-            .name = exe_name,
             .api_level = .android15,
             .build_tools_version = "35.0.1",
             .ndk_version = "29.0.13113456",
@@ -31,10 +29,6 @@ pub fn build(b: *std.Build) void {
         apk.setKeyStore(key_store_file);
         apk.setAndroidManifest(b.path("android/AndroidManifest.xml"));
         apk.addResourceDirectory(b.path("android/res"));
-
-        const generated_asset_dir = b.addNamedWriteFiles("android_asset_directory");
-        _ = generated_asset_dir.addCopyFile(b.path("src/zig.bmp"), "zig.bmp");
-        apk.addAssetDirectory(generated_asset_dir.getDirectory());
 
         break :blk apk;
     };
@@ -53,10 +47,6 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .android_api_version = @as([]const u8, b.fmt("{}", .{@intFromEnum(apk.api_level)})),
                 .android_ndk = @as([]const u8, apk.ndk.path),
-                // NOTE(jae): 2026-04-09
-                // Must be statically built for Android, otherwise "android_main" is not handled here:
-                // https://github.com/raysan5/raylib/blob/f89d38b086c1d0a0c7e38c9c648aa91c05646300/src/platforms/rcore_android.c#L322
-                .linkage = LinkMode.static,
             })
         else
             b.dependency("raylib_zig", .{
@@ -65,14 +55,7 @@ pub fn build(b: *std.Build) void {
                 .linkage = LinkMode.dynamic,
             });
 
-        const raylib_lib = raylib_dep.artifact("raylib");
-        // NOTE(jae): 2026-04-09
-        // Enable PIC=true for Raylib, otherwise it will not compile.
-        //
-        // ld.lld: relocation R_AARCH64_ADD_ABS_LO12_NC cannot be used against symbol 'CORE'; recompile with -fPIC
-        //         relocation R_X86_64_64 cannot be used against local symbol; recompile with -fPIC
-        raylib_lib.root_module.pic = true;
-        app.linkLibrary(raylib_lib);
+        app.linkLibrary(raylib_dep.artifact("raylib"));
         app.addImport("raylib", raylib_dep.module("raylib"));
 
         if (android_apk) |apk| {
@@ -88,15 +71,12 @@ pub fn build(b: *std.Build) void {
             app.addIncludePath(native_app_glue_dir);
 
             apk.addArtifact(b.addLibrary(.{
-                .name = "main",
-                .root_module = app,
                 .linkage = .dynamic,
-            }));
-        } else {
-            const exe = b.addExecutable(.{
                 .name = exe_name,
                 .root_module = app,
-            });
+            }));
+        } else {
+            const exe = b.addExecutable(.{ .name = exe_name, .root_module = app });
             b.installArtifact(exe);
 
             const run_exe = b.addRunArtifact(exe);

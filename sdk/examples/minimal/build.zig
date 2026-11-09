@@ -19,7 +19,6 @@ pub fn build(b: *std.Build) void {
 
         const android_sdk = android.Sdk.create(b, .{});
         const apk = android_sdk.createApk(.{
-            .name = exe_name,
             .api_level = .android15,
             .build_tools_version = "35.0.1",
             .ndk_version = "29.0.13113456",
@@ -51,7 +50,7 @@ pub fn build(b: *std.Build) void {
         });
 
         var exe: *std.Build.Step.Compile = if (target.result.abi.isAndroid()) b.addLibrary(.{
-            .name = "main",
+            .name = exe_name,
             .root_module = app_module,
             .linkage = .dynamic,
         }) else b.addExecutable(.{

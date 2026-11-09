@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const android = @import("android");
 
 pub fn build(b: *std.Build) void {
-    const exe_name: []const u8 = "sdl-zig-demo";
     const root_target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const android_targets = android.standardTargets(b, root_target);
@@ -21,20 +20,28 @@ pub fn build(b: *std.Build) void {
 
         const android_sdk = android.Sdk.create(b, .{});
         const apk = android_sdk.createApk(.{
-            .name = exe_name,
             .api_level = .android15,
             .build_tools_version = "36.1.0",
             .ndk_version = "29.0.14206865",
+            // NOTE(jae): 2025-03-09
+            // Previously this example used 'ndk' "27.0.12077973".
+            //
+            // However that has issues with the latest SDL2 version when including 'hardware_buffer.h'
+            // for 32-bit builds.
+            //
+            // - AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL << 32
+            //  - ndk/27.0.12077973/toolchains/llvm/prebuilt/{OS}-x86_64/sysroot/usr/include/android/hardware_buffer.h:322:42:
+            //  - error: expression is not an integral constant expression
         });
 
         const key_store_file = android_sdk.createKeyStore(.example);
         apk.setKeyStore(key_store_file);
         apk.setAndroidManifest(b.path("android/AndroidManifest.xml"));
-        apk.addResourceDirectory(b.path("android/res"));
 
         const generated_asset_dir = b.addNamedWriteFiles("android_asset_directory");
         _ = generated_asset_dir.addCopyFile(b.path("src/zig.bmp"), "zig.bmp");
         apk.addAssetDirectory(generated_asset_dir.getDirectory());
+        apk.addResourceDirectory(b.path("android/res"));
 
         // Add Java files
         if (!crash_on_exception) {
@@ -54,20 +61,14 @@ pub fn build(b: *std.Build) void {
             .target = android_targets[0],
         });
         const sdl_java_files = sdl_dep.namedWriteFiles("sdljava");
-        if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 16) {
-            // Deprecated: Zig 0.16.X and lower
-            for (sdl_java_files.files.items) |file| {
-                apk.addJavaSourceFile(.{ .file = file.contents.copy });
-            }
-        } else {
-            for (sdl_java_files.copies.items) |copy| {
-                apk.addJavaSourceFile(.{ .file = copy.src_file });
-            }
+        for (sdl_java_files.files.items) |file| {
+            apk.addJavaSourceFile(.{ .file = file.contents.copy });
         }
         break :blk apk;
     };
 
     for (targets) |target| {
+        const exe_name: []const u8 = "sdl-zig-demo";
         const app_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
@@ -114,7 +115,7 @@ pub fn build(b: *std.Build) void {
             app_module.addImport("android", android_dep.module("android"));
 
             const exe_lib = b.addLibrary(.{
-                .name = "main",
+                .name = exe_name,
                 .root_module = app_module,
                 .linkage = .dynamic,
             });

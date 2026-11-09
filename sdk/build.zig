@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
-
 const androidbuild = @import("src/androidbuild/androidbuild.zig");
+
+// Expose Android build functionality for use in your build.zig
+
+// TODO: rename tools.zig to Sdk.zig
+pub const Sdk = @import("src/androidbuild/tools.zig");
+pub const Apk = @import("src/androidbuild/apk.zig");
 pub const ApiLevel = androidbuild.ApiLevel;
 pub const standardTargets = androidbuild.standardTargets;
-pub const resolveTargets = androidbuild.resolveTargets;
-pub const Apk = @import("src/androidbuild/Apk.zig");
-pub const Sdk = @import("src/androidbuild/tools.zig");
 
 // Deprecated exposed fields
 
@@ -28,13 +30,9 @@ pub fn build(b: *std.Build) void {
 
     // Create stub of builtin options.
     // This is discovered and then replaced by "Apk" in the build process
-    // const android_builtin_options = std.Build.addOptions(b);
-    // android_builtin_options.addOption([:0]const u8, "package_name", "");
-    const android_builtin_module = b.createModule(.{
-        .root_source_file = b.path("src/android/android_builtin.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const android_builtin_options = std.Build.addOptions(b);
+    android_builtin_options.addOption([:0]const u8, "package_name", "");
+    const android_builtin_module = android_builtin_options.createModule();
 
     // Create android module
     const android_module = b.addModule("android", .{
