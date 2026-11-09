@@ -14,6 +14,11 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Pasang Android NDK
+        run: |
+          SDKM=$(ls -d $ANDROID_HOME/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          yes | $SDKM --licenses > /dev/null || true
+          $SDKM "ndk;29.0.13113456" "build-tools;35.0.0" "platforms;android-35"
       - run: zig build -Dandroid=true --verbose
         working-directory: sdk/examples/minimal
       - uses: actions/upload-artifact@v4
