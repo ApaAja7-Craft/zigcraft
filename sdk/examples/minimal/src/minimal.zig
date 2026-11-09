@@ -60,6 +60,7 @@ fn nativeActivityOnCreate(activity: *androidbind.ANativeActivity, savedState: []
     errdefer allocator.destroy(app);
 
     activity.callbacks.* = makeNativeActivityGlue(AndroidApp);
+    activity.callbacks.onNativeWindowCreated = onWindowCreated;
     app.* = try AndroidApp.init(
         allocator,
         activity,
@@ -231,4 +232,40 @@ fn makeNativeActivityGlue(comptime App: type) androidbind.ANativeActivityCallbac
         .onConfigurationChanged = T.onConfigurationChanged,
         .onLowMemory = T.onLowMemory,
     };
+}
+
+const NativeBuffer = extern struct {
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: i32,
+    bits: ?*anyopaque,
+    reserved: [6]u32,
+};
+
+extern "android" fn ANativeWindow_setBuffersGeometry(window: *androidbind.ANativeWindow, width: i32, height: i32, format: i32) i32;
+extern "android" fn ANativeWindow_lock(window: *androidbind.ANativeWindow, out: *NativeBuffer, dirty: ?*anyopaque) i32;
+extern "android" fn ANativeWindow_unlockAndPost(window: *androidbind.ANativeWindow) i32;
+
+fn onWindowCreated(activity: *androidbind.ANativeActivity, window: *androidbind.ANativeWindow) callconv(.c) void {
+    _ = activity;
+    _ = ANativeWindow_setBuffersGeometry(window, 0, 0, 1);
+    var buf: NativeBuffer = undefined;
+    if (ANativeWindow_lock(window, &buf, null) != 0) {
+        log.err("gagal lock window", .{});
+        return;
+    }
+    const w: usize = @intCast(buf.width);
+    const h: usize = @intCast(buf.height);
+    const stride: usize = @intCast(buf.stride);
+    const pixels: [*]u32 = @ptrCast(@alignCast(buf.bits.?));
+    for (0..h) |y| {
+        const g: u32 = @intCast(y * 255 / h);
+        const warna: u32 = 0xFF000000 | (0xFF << 16) | (g << 8) | 0x40;
+        for (0..w) |x| {
+            pixels[y * stride + x] = warna;
+        }
+    }
+    _ = ANativeWindow_unlockAndPost(window);
+    log.debug("Layar berhasil dicat!", .{});
 }
